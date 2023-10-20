@@ -1,0 +1,9 @@
+{
+    "servers": [
+        {
+            "adress": "localhost",
+            "port": 9000,
+            "max_job": 10
+        }
+    ]
+}
