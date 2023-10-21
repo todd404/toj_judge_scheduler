@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -29,17 +28,15 @@ type Job struct {
 	Body []byte
 }
 
-var serverReserveMap = make(map[Server]int)
-var judgeQueue []Job
-var realUuidMap = make(map[string]string)
-var serverMap = make(map[string]Server)
-
-var (
-	serverReserveMapMutex sync.Mutex
-	judgeQueueMutex       sync.Mutex
-	realUuidMapMutex      sync.Mutex
-	serverMapMutex        sync.Mutex
-)
+var judgeQueue = make(chan Job, 100)
+var jobPool = sync.Pool{
+	New: func() interface{} {
+		return new(Job)
+	},
+}
+var serverReserveMap sync.Map
+var realUuidMap sync.Map
+var serverMap sync.Map
 
 func main() {
 	config, err := loadConfig()
@@ -49,18 +46,18 @@ func main() {
 	}
 
 	initMap(config)
+	go judgeWorker()
 
 	http.HandleFunc("/judge", handleJudgeRequest)
 	http.HandleFunc("/state", handleStateRequest)
 
-	go judgeWorker()
 	http.ListenAndServe(":7000", nil)
 }
 
 func initMap(config ServerConfig) {
 	servers := config.Servers
 	for _, s := range servers {
-		serverReserveMap[s] = s.MaxJob
+		serverReserveMap.Store(s, s.MaxJob)
 	}
 }
 
@@ -80,27 +77,32 @@ func loadConfig() (server_config ServerConfig, err error) {
 }
 
 func handleJudgeRequest(w http.ResponseWriter, r *http.Request) {
-	_uuid := uuid.New().String()
+	job := jobPool.Get().(*Job)
+	defer jobPool.Put(job)
+	job.Uuid = uuid.New().String()
 
-	realUuidMapMutex.Lock()
-	realUuidMap[_uuid] = "queuing"
-	realUuidMapMutex.Unlock()
+	realUuidMap.Store(job.Uuid, "queuing")
 
 	body, err := io.ReadAll(r.Body)
-	var job Job
-	if err == nil {
-		job = Job{_uuid, body}
-	}
 
-	judgeQueueMutex.Lock()
-	judgeQueue = append(judgeQueue, job)
-	judgeQueueMutex.Unlock()
+	if err != nil {
+		log.Printf("Read request body fail: %v", err)
+		http.Error(w, "Judge Scheduler Crash", 500)
+		return
+	}
+	job.Body = body
+
+	//开一个协程异步在judgeQueue channel里放job
+	//防止阻塞而导致uuid无法返回
+	go func() {
+		judgeQueue <- *job
+	}()
 
 	var res struct {
 		Uuid string `json:"uuid"`
 	}
 
-	res.Uuid = _uuid
+	res.Uuid = job.Uuid
 
 	w.Header().Set("content-type", "text/json")
 	json.NewEncoder(w).Encode(res)
@@ -115,9 +117,7 @@ func handleStateRequest(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	uuid := query.Get("uuid")
 
-	realUuidMapMutex.Lock()
-	realUuid, ok := realUuidMap[uuid]
-	realUuidMapMutex.Unlock()
+	realUuid, ok := realUuidMap.Load(uuid)
 
 	if uuid == "" || !ok {
 		res.State = "error uuid"
@@ -140,9 +140,8 @@ func handleStateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serverMapMutex.Lock()
-	server := serverMap[uuid]
-	serverMapMutex.Unlock()
+	value, _ := serverMap.Load(uuid)
+	server := value.(Server)
 
 	resp, err := http.Get(fmt.Sprintf("http://%s:%d/state?uuid=%s", server.Adress, server.Port, realUuid))
 	if err != nil {
@@ -154,59 +153,42 @@ func handleStateRequest(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Http get: http://%s:%d/state?uuid=%s fail", server.Adress, server.Port, realUuid)
 	}
 
-	// var respBody struct {
-	// 	State   string `json:"state"`
-	// 	Message string `json:"message"`
-	// }
-
-	// json.NewDecoder(resp.Body).Decode(&respBody)
 	w.Header().Set("Content-Type", "application/json")
 	io.Copy(w, resp.Body)
 }
 
 func judgeWorker() {
-	for {
-		var continueFlag bool
-		judgeQueueMutex.Lock()
-		if len(judgeQueue) == 0 {
-			continueFlag = true
-		}
-		judgeQueueMutex.Unlock()
-		if continueFlag {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		judgeQueueMutex.Lock()
-		job := judgeQueue[0]
-		judgeQueue = judgeQueue[1:]
-		judgeQueueMutex.Unlock()
-
+	for job := range judgeQueue {
 		go func(job Job) {
-			var idleServer Server
-			serverReserveMapMutex.Lock()
-			for server, reserve := range serverReserveMap {
+			var idleServer Server = Server{}
+
+			serverReserveMap.Range(func(key, value any) bool {
+				server := key.(Server)
+				reserve := value.(int)
+
 				if reserve > 0 {
 					idleServer = server
-					serverReserveMap[server] -= 1
-					break
+					serverReserveMap.Store(server, reserve-1)
+					return false //break
 				}
+
+				return true //continue
+			})
+
+			if (idleServer == Server{}) {
+				judgeQueue <- job
+				return
 			}
-			serverReserveMapMutex.Unlock()
 
 			resp, err := http.Post(fmt.Sprintf("http://%s:%d/judge", idleServer.Adress, idleServer.Port), "application/json", bytes.NewBuffer(job.Body))
 			if err != nil {
-				realUuidMapMutex.Lock()
-				realUuidMap[job.Uuid] = "error"
-				realUuidMapMutex.Unlock()
+				realUuidMap.Store(job.Uuid, "error")
 				return
 			}
 
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
-				realUuidMapMutex.Lock()
-				realUuidMap[job.Uuid] = "error"
-				realUuidMapMutex.Unlock()
+				realUuidMap.Store(job.Uuid, "error")
 				return
 			}
 
@@ -216,13 +198,8 @@ func judgeWorker() {
 
 			json.NewDecoder(resp.Body).Decode(&respData)
 
-			realUuidMapMutex.Lock()
-			realUuidMap[job.Uuid] = respData.Uuid
-			realUuidMapMutex.Unlock()
-
-			serverMapMutex.Lock()
-			serverMap[job.Uuid] = idleServer
-			serverMapMutex.Unlock()
+			realUuidMap.Store(job.Uuid, respData.Uuid)
+			serverMap.Store(job.Uuid, idleServer)
 		}(job)
 	}
 }
