@@ -1,9 +1,23 @@
 {
+    "backend_server":{
+        "adress": "localhost",
+        "port": 8080
+    },
     "servers": [
         {
-            "adress": "localhost",
+            "adress": "192.168.1.193",
             "port": 9000,
-            "max_job": 10
+            "max_job": 20
+        },
+        {
+            "adress": "192.168.1.193",
+            "port": 9001,
+            "max_job": 30
+        },
+        {
+            "adress": "192.168.1.193",
+            "port": 9002,
+            "max_job": 30
         }
     ]
 }
