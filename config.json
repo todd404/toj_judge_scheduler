@@ -1,4 +1,6 @@
 {
+    "port": 7000,
+    "check_interval": 30,
     "backend_server":{
         "adress": "localhost",
         "port": 8080

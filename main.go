@@ -8,8 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
-	"runtime"
 	"sync"
 	"time"
 
@@ -23,6 +21,8 @@ type Server struct {
 }
 
 type ServerConfig struct {
+	Port          int `json:"port"`
+	CheckInterval int `json:"check_interval"`
 	BackendServer struct {
 		Adress string `json:"adress"`
 		Port   int    `json:"port"`
@@ -36,6 +36,13 @@ type Job struct {
 }
 
 var config ServerConfig
+var transport = &http.Transport{
+	MaxIdleConnsPerHost: 100,
+}
+var client = &http.Client{
+	Transport: transport,
+}
+
 var judgeQueue = make(chan Job, 100)
 var jobPool = sync.Pool{
 	New: func() interface{} {
@@ -43,11 +50,13 @@ var jobPool = sync.Pool{
 	},
 }
 var serverReserveMap = make(map[Server]int)
+var serverAliveMap = make(map[Server]bool)
 var uuidRealUuidMap sync.Map
 var realUuidUuidMap sync.Map
 var serverMap sync.Map
 
 var serverReserveMapMutex sync.RWMutex
+var serverAliveMapMutex sync.RWMutex
 
 func main() {
 	var err error
@@ -58,20 +67,23 @@ func main() {
 	}
 
 	initMap(config)
+
 	go judgeWorker()
-	go monitorServerReserve()
+	go monitorServerAlive()
 
 	http.HandleFunc("/judge", handleJudgeRequest)
 	http.HandleFunc("/state", handleStateRequest)
 	http.HandleFunc("/api/set-result", handleSetResult)
+	http.HandleFunc("/server-status", handleServerStatus)
 
-	http.ListenAndServe(":7000", nil)
+	http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil)
 }
 
 func initMap(config ServerConfig) {
 	servers := config.Servers
 	for _, s := range servers {
 		serverReserveMap[s] = s.MaxJob
+		serverAliveMap[s] = true
 	}
 }
 
@@ -158,7 +170,7 @@ func handleStateRequest(w http.ResponseWriter, r *http.Request) {
 	value, _ := serverMap.Load(uuid)
 	server := value.(Server)
 
-	resp, err := http.Get(fmt.Sprintf("http://%s:%d/state?uuid=%s", server.Adress, server.Port, realUuid))
+	resp, err := client.Get(fmt.Sprintf("http://%s:%d/state?uuid=%s", server.Adress, server.Port, realUuid))
 	if err != nil {
 		log.Printf("Http get: http://%s:%d/state?uuid=%s fail", server.Adress, server.Port, realUuid)
 	}
@@ -172,6 +184,37 @@ func handleStateRequest(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
+func handleServerStatus(w http.ResponseWriter, r *http.Request) {
+	type ServerStatusItem struct {
+		Adress  string `json:"adress"`
+		Port    int    `json:"port"`
+		Alive   bool   `json:"alive"`
+		Reserve int    `json:"reserve"`
+	}
+
+	var response struct {
+		ServerStatusList []ServerStatusItem `json:"servers"`
+	}
+
+	for _, s := range config.Servers {
+		status := ServerStatusItem{}
+
+		status.Adress = s.Adress
+		status.Port = s.Port
+		serverAliveMapMutex.RLock()
+		status.Alive = serverAliveMap[s]
+		serverAliveMapMutex.RUnlock()
+
+		serverReserveMapMutex.RLock()
+		status.Reserve = serverReserveMap[s]
+		serverAliveMapMutex.RUnlock()
+
+		response.ServerStatusList = append(response.ServerStatusList, status)
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
 func judgeWorker() {
 	for job := range judgeQueue {
 		go func(job Job) {
@@ -180,9 +223,13 @@ func judgeWorker() {
 			serverReserveMapMutex.Lock()
 			for server, reserve := range serverReserveMap {
 				if reserve > 0 {
-					idleServer = server
-					serverReserveMap[server]--
-					break
+					serverAliveMapMutex.RLock()
+					if serverAliveMap[server] {
+						idleServer = server
+						serverReserveMap[server]--
+						break
+					}
+					serverAliveMapMutex.RUnlock()
 				}
 			}
 			serverReserveMapMutex.Unlock()
@@ -193,7 +240,7 @@ func judgeWorker() {
 				return
 			}
 
-			resp, err := http.Post(
+			resp, err := client.Post(
 				fmt.Sprintf("http://%s:%d/judge", idleServer.Adress, idleServer.Port),
 				"application/json",
 				bytes.NewBuffer(job.Body),
@@ -253,14 +300,14 @@ func handleSetResult(w http.ResponseWriter, r *http.Request) {
 	serverReserveMap[server]++
 	serverReserveMapMutex.Unlock()
 
-	resp, err := http.Post(
+	resp, err := client.Post(
 		fmt.Sprintf("http://%s:%d/api/set-result", config.BackendServer.Adress, config.BackendServer.Port),
 		"application/json",
 		r.Body,
 	)
 
 	if err != nil {
-		log.Printf("Report result fail!: %v", err)
+		log.Printf("Report result fail!: %v", err.Error())
 	}
 
 	defer resp.Body.Close()
@@ -269,40 +316,56 @@ func handleSetResult(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func clearTerminal() {
-	optSys := runtime.GOOS
-	if optSys == "linux" {
-		//执行clear指令清除控制台
-		cmd := exec.Command("clear")
-		cmd.Stdout = os.Stdout
-		err := cmd.Run()
+func checkServerAlive() {
+	serverChannel := make(chan Server)
+
+	go func() {
+		server := <-serverChannel
+
+		url := fmt.Sprintf("http://%s:%d/ping", server.Adress, server.Port)
+
+		resp, err := client.Get(url)
 		if err != nil {
-			log.Fatalf("cmd: clear error: %v\n", err.Error())
+			serverAliveMapMutex.Lock()
+			serverAliveMap[server] = false
+			serverAliveMapMutex.Unlock()
+			return
 		}
-	} else {
-		//执行clear指令清除控制台
-		cmd := exec.Command("cmd", "/c", "cls")
-		cmd.Stdout = os.Stdout
-		err := cmd.Run()
-		if err != nil {
-			log.Fatalf("cmd: cls error: %v\n", err.Error())
+
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			serverAliveMapMutex.Lock()
+			serverAliveMap[server] = false
+			serverAliveMapMutex.Unlock()
+			return
 		}
+
+		var body []byte
+		resp.Body.Read(body)
+		s := string(body)
+
+		if s != "pong" {
+			serverAliveMapMutex.Lock()
+			serverAliveMap[server] = false
+			serverAliveMapMutex.Unlock()
+			return
+		}
+
+		serverAliveMapMutex.Lock()
+		serverAliveMap[server] = true
+		serverAliveMapMutex.Unlock()
+	}()
+
+	for _, server := range config.Servers {
+		serverChannel <- server
 	}
 }
 
-func monitorServerReserve() {
-	ticker := time.NewTicker(300 * time.Millisecond) // 每 0.3 秒检查一次
+func monitorServerAlive() {
+	ticker := time.NewTicker(time.Duration(config.CheckInterval) * time.Second) // 每 1 秒检查一次
 	defer ticker.Stop()
 
-	for range ticker.C {
-		clearTerminal()
-
-		serverReserveMapMutex.RLock()
-		statusLine := ""
-		for server, reserve := range serverReserveMap {
-			// 在这里处理每个服务器的剩余可用量
-			statusLine += fmt.Sprintf("Server: %s:%d, Remaining Jobs: %d\n", server.Adress, server.Port, reserve)
-		}
-		serverReserveMapMutex.RUnlock()
+	for ; true; <-ticker.C {
+		checkServerAlive()
 	}
 }
