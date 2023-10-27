@@ -50,13 +50,12 @@ var jobPool = sync.Pool{
 	},
 }
 var serverReserveMap = make(map[Server]int)
-var serverAliveMap = make(map[Server]bool)
+var serverAliveMap sync.Map
 var uuidRealUuidMap sync.Map
 var realUuidUuidMap sync.Map
 var serverMap sync.Map
 
 var serverReserveMapMutex sync.RWMutex
-var serverAliveMapMutex sync.RWMutex
 
 func main() {
 	var err error
@@ -83,7 +82,7 @@ func initMap(config ServerConfig) {
 	servers := config.Servers
 	for _, s := range servers {
 		serverReserveMap[s] = s.MaxJob
-		serverAliveMap[s] = true
+		serverAliveMap.Store(s, true)
 	}
 }
 
@@ -201,17 +200,20 @@ func handleServerStatus(w http.ResponseWriter, r *http.Request) {
 
 		status.Adress = s.Adress
 		status.Port = s.Port
-		serverAliveMapMutex.RLock()
-		status.Alive = serverAliveMap[s]
-		serverAliveMapMutex.RUnlock()
+		alive, ok := serverAliveMap.Load(s)
+		if !ok {
+			log.Print("Read serverAliveMap error")
+		}
+		status.Alive = alive.(bool)
 
 		serverReserveMapMutex.RLock()
 		status.Reserve = serverReserveMap[s]
-		serverAliveMapMutex.RUnlock()
+		serverReserveMapMutex.RUnlock()
 
 		response.ServerStatusList = append(response.ServerStatusList, status)
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
@@ -223,19 +225,22 @@ func judgeWorker() {
 			serverReserveMapMutex.Lock()
 			for server, reserve := range serverReserveMap {
 				if reserve > 0 {
-					serverAliveMapMutex.RLock()
-					if serverAliveMap[server] {
+					alive, ok := serverAliveMap.Load(server)
+					if !ok {
+						//log
+						continue
+					}
+					if alive.(bool) {
 						idleServer = server
 						serverReserveMap[server]--
 						break
 					}
-					serverAliveMapMutex.RUnlock()
 				}
 			}
 			serverReserveMapMutex.Unlock()
 
 			if idleServer == (Server{}) {
-				//time.Sleep(5 * time.Millisecond)
+				time.Sleep(30 * time.Millisecond)
 				judgeQueue <- job
 				return
 			}
@@ -250,6 +255,9 @@ func judgeWorker() {
 				serverReserveMapMutex.Lock()
 				serverReserveMap[idleServer]++
 				serverReserveMapMutex.Unlock()
+
+				time.Sleep(30 * time.Millisecond)
+				judgeQueue <- job
 				//TODO: log
 				return
 			}
@@ -260,6 +268,9 @@ func judgeWorker() {
 				serverReserveMapMutex.Lock()
 				serverReserveMap[idleServer]++
 				serverReserveMapMutex.Unlock()
+
+				time.Sleep(30 * time.Millisecond)
+				judgeQueue <- job
 				//TODO: log
 				return
 			}
@@ -281,6 +292,7 @@ func handleSetResult(w http.ResponseWriter, r *http.Request) {
 	var data struct {
 		RealUuid string `json:"uuid"`
 	}
+	defer r.Body.Close()
 	json.NewDecoder(r.Body).Decode(&data)
 
 	uuid, ok := realUuidUuidMap.Load(data.RealUuid)
@@ -316,45 +328,43 @@ func handleSetResult(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+var serverChannel = make(chan Server, 10)
+
+func checkAliveWorker() {
+	for server := range serverChannel {
+		go func(server Server) {
+			url := fmt.Sprintf("http://%s:%d/ping", server.Adress, server.Port)
+
+			resp, err := client.Get(url)
+
+			if err != nil {
+				serverAliveMap.Store(server, false)
+				return
+			}
+
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				serverAliveMap.Store(server, false)
+				return
+			}
+
+			len := resp.ContentLength
+			body := make([]byte, len)
+			resp.Body.Read(body)
+			s := string(body)
+
+			if s != "pong" {
+				serverAliveMap.Store(server, false)
+				return
+			}
+
+			serverAliveMap.Store(server, true)
+		}(server)
+	}
+}
+
 func checkServerAlive() {
-	serverChannel := make(chan Server)
-
-	go func() {
-		server := <-serverChannel
-
-		url := fmt.Sprintf("http://%s:%d/ping", server.Adress, server.Port)
-
-		resp, err := client.Get(url)
-		if err != nil {
-			serverAliveMapMutex.Lock()
-			serverAliveMap[server] = false
-			serverAliveMapMutex.Unlock()
-			return
-		}
-
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			serverAliveMapMutex.Lock()
-			serverAliveMap[server] = false
-			serverAliveMapMutex.Unlock()
-			return
-		}
-
-		var body []byte
-		resp.Body.Read(body)
-		s := string(body)
-
-		if s != "pong" {
-			serverAliveMapMutex.Lock()
-			serverAliveMap[server] = false
-			serverAliveMapMutex.Unlock()
-			return
-		}
-
-		serverAliveMapMutex.Lock()
-		serverAliveMap[server] = true
-		serverAliveMapMutex.Unlock()
-	}()
+	go checkAliveWorker()
 
 	for _, server := range config.Servers {
 		serverChannel <- server
