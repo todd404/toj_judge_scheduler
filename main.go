@@ -293,7 +293,9 @@ func handleSetResult(w http.ResponseWriter, r *http.Request) {
 		RealUuid string `json:"uuid"`
 	}
 	defer r.Body.Close()
-	json.NewDecoder(r.Body).Decode(&data)
+	bodyBytes, err := io.ReadAll(r.Body)
+
+	json.NewDecoder(bytes.NewBuffer(bodyBytes)).Decode(&data)
 
 	uuid, ok := realUuidUuidMap.Load(data.RealUuid)
 	if !ok {
@@ -312,10 +314,15 @@ func handleSetResult(w http.ResponseWriter, r *http.Request) {
 	serverReserveMap[server]++
 	serverReserveMapMutex.Unlock()
 
+	if err != nil {
+		log.Printf("Failed to read request body: %v", err)
+		return
+	}
+
 	resp, err := client.Post(
 		fmt.Sprintf("http://%s:%d/api/set-result", config.BackendServer.Adress, config.BackendServer.Port),
 		"application/json",
-		r.Body,
+		bytes.NewBuffer(bodyBytes),
 	)
 
 	if err != nil {
